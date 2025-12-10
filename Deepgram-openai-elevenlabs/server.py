@@ -392,13 +392,20 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
         print("Plivo handler exiting for connection")
 
 
+# ---------------- Router and server (with /health HTTP endpoint) ----------------
+async def router(ws, path):
+    if path == "/stream":
+        print("Incoming connection on /stream")
+        await plivo_handler(ws)
+    else:
+        print(f"Unknown path {path}, closing")
+        await ws.close()
 
-# ------------ HTTP process_request for health checks ------------
+# HTTP handler for simple health checks on the same port
 async def process_request(path, request_headers):
     """
     Handle simple HTTP requests on the same port as the WebSocket server.
-    Returns a tuple (status, headers, body) for HTTP responses, or None to let
-    the websocket handshake proceed.
+    Return (status, headers, body) for HTTP responses, or None to continue websocket handshake.
     """
     if path == "/health":
         try:
@@ -411,17 +418,16 @@ async def process_request(path, request_headers):
             ("Content-Length", str(len(body))),
         ]
         return 200, headers, body
-    # return None so the websockets server handles WebSocket upgrades for other paths
     return None
 
 def start_server(host: str, port: int):
     """
-    Start a websockets server that also responds to plain HTTP GET /health via process_request.
+    Start websockets server that also responds to HTTP /health via process_request.
     """
     print(f"Starting websocket server on {host}:{port} (with /health HTTP endpoint)")
     return websockets.serve(router, host, port, process_request=process_request)
 
-# ------------ Entrypoint ------------
+# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
     try:
         PORT = int(os.getenv("PORT", os.getenv("port", "5000")))
