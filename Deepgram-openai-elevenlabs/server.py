@@ -7,11 +7,13 @@ import base64
 import io
 import traceback
 import wave
+
 from typing import Optional
 
 import numpy as np
 import webrtcvad
 import websockets
+import audioop
 
 from deepgram import Deepgram
 from openai import OpenAI
@@ -257,8 +259,8 @@ async def synthesize_and_play(text: str, plivo_ws):
 
 # ---------------- plivo_handler (aggregated logging, keepalive, health checks) ----------------
 async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, silence_threshold_sec: float = 0.5):
-    print("Plivo handler started for connection (aggregated logging + health checks)")
-    # run health checks but do not block long
+    print("Plivo handler started for connection (mu-law -> PCM16 conversion + aggregated logging)")
+    # quick health checks (non-blocking)
     try:
         task = asyncio.create_task(run_api_health_checks())
         await asyncio.wait_for(task, timeout=6.0)
@@ -268,7 +270,7 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
         print(f"[API HEALTH] health check error: {e}")
 
     vad = webrtcvad.Vad(vad_mode)
-    inbuffer = bytearray()
+    inbuffer = bytearray()          # will hold PCM16 bytes
     silence_accum = 0.0
     last_chunk_had_speech = False
 
@@ -281,9 +283,7 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
                 await asyncio.sleep(10)
                 try:
                     await plivo_ws.ping()
-                    print("[PING] Sent ping")
-                except Exception as e:
-                    print(f"[PING] Ping failed: {e}")
+                except Exception:
                     break
         except asyncio.CancelledError:
             pass
@@ -295,7 +295,6 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
             try:
                 data = json.loads(raw)
             except Exception:
-                # ignore non-JSON frames
                 continue
 
             event = data.get("event", "")
@@ -307,17 +306,27 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
                     continue
 
                 try:
-                    chunk = base64.b64decode(payload_b64)
+                    mulaw_chunk = base64.b64decode(payload_b64)
                 except Exception:
                     continue
 
-                inbuffer.extend(chunk)
+                # convert mu-law (u-law) bytes to 16-bit PCM (linear) for VAD and Deepgram
+                try:
+                    # audioop.ulaw2lin(input_bytes, width) -> linear bytes where width is target sample width in bytes (2 for 16-bit)
+                    pcm16_chunk = audioop.ulaw2lin(mulaw_chunk, 2)
+                except Exception as e:
+                    print(f"[ERROR] mu-law -> PCM conversion failed: {e}")
+                    continue
 
-                # VAD: 20ms frames
-                frame_bytes = int(sample_rate * 2 * 0.02)
+                # append PCM16 bytes into buffer (consistent format for VAD and Deepgram)
+                inbuffer.extend(pcm16_chunk)
+
+                # VAD expects 16-bit frames; compute 20ms frame size in bytes: sample_rate * bytes_per_sample * 0.02
+                frame_bytes = int(sample_rate * 2 * 0.02)  # 2 bytes per sample (16-bit), 20ms frames
                 has_speech = False
-                for start in range(0, len(chunk), frame_bytes):
-                    frame = chunk[start:start + frame_bytes]
+                # loop frames inside the PCM chunk (not mu-law)
+                for start in range(0, len(pcm16_chunk), frame_bytes):
+                    frame = pcm16_chunk[start:start + frame_bytes]
                     if len(frame) < frame_bytes:
                         break
                     try:
@@ -325,14 +334,19 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
                             has_speech = True
                             break
                     except Exception:
+                        # ignore VAD frame errors
                         pass
 
                 if has_speech:
+                    # log first detection event so it's visible in logs
+                    if not last_chunk_had_speech:
+                        print(f"[VAD] speech detected (media_chunks={media_counter})")
                     last_chunk_had_speech = True
                     silence_accum = 0.0
                 else:
                     silence_accum += 0.02
                     if last_chunk_had_speech and silence_accum >= silence_threshold_sec:
+                        # end of utterance — process PCM16 buffer
                         if len(inbuffer) > 2048:
                             print(f"[MEDIA] End of utterance. media_chunks={media_counter} buffer_bytes={len(inbuffer)}")
                             try:
@@ -346,11 +360,13 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
                             except Exception as e:
                                 print(f"[PROCESS ERROR] {e}")
                                 traceback.print_exc()
+                        # reset
                         inbuffer = bytearray()
                         silence_accum = 0.0
                         last_chunk_had_speech = False
                         media_counter = 0
 
+                # periodic compact log: once per second
                 now = asyncio.get_event_loop().time()
                 if now - last_log_time >= 1.0:
                     print(f"[MEDIA STATS] chunks={media_counter} buffer_bytes={len(inbuffer)} last_has_speech={last_chunk_had_speech}")
