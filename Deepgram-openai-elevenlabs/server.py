@@ -1,39 +1,76 @@
-import asyncio
-import base64
+# server.py
+import os
 import json
 import sys
-import webrtcvad
-import websockets
-from deepgram import Deepgram
+import asyncio
+import base64
 import io
 import traceback
-import numpy as np
 import wave
+from typing import Optional
+
+import numpy as np
+import webrtcvad
+import websockets
+
+from deepgram import Deepgram
 from openai import OpenAI
-from elevenlabs import VoiceSettings
 from elevenlabs.client import ElevenLabs
+from elevenlabs import VoiceSettings
+
+# ------------ Configuration loader (env first, fallback to config.json) ------------
+def load_config_from_env_or_file(file_path: str = "config.json"):
+    cfg = {
+        # Plivo
+        "PLIVO_AUTH_ID": os.getenv("PLIVO_AUTH_ID"),
+        "PLIVO_AUTH_TOKEN": os.getenv("PLIVO_AUTH_TOKEN"),
+        # Third party APIs
+        "DEEPGRAM_API_KEY": os.getenv("DEEPGRAM_API_KEY"),
+        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+        "ELEVENLABS_API_KEY": os.getenv("ELEVENLABS_API_KEY"),
+        # Optional
+        "VOICE_ID": os.getenv("VOICE_ID"),  # ElevenLabs voice id override
+    }
+
+    # If any required keys are missing and a config file exists, try loading it
+    missing = [k for k, v in cfg.items() if v is None]
+    if missing and os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                disk = json.load(f)
+            # Look for lowercase keys in the file (repo convention)
+            for k in cfg:
+                if not cfg[k]:
+                    val = disk.get(k.lower())
+                    if val:
+                        cfg[k] = val
+        except Exception:
+            # do not raise here, proceed with what we have
+            traceback.print_exc()
+
+    return cfg
 
 
-# Load the configuration from a JSON file (API keys, settings, etc.)
-def load_config(file_path='config.json'):
-    global CONFIG
-    with open(file_path, 'r') as f:
-        CONFIG = json.load(f)
-    return CONFIG
+CONFIG = load_config_from_env_or_file()
 
+# Validate minimal keys (warn rather than crash so you can run locally with partial config)
+if not CONFIG.get("DEEPGRAM_API_KEY"):
+    print("Warning: DEEPGRAM_API_KEY not found in environment or config.json")
+if not CONFIG.get("OPENAI_API_KEY"):
+    print("Warning: OPENAI_API_KEY not found in environment or config.json")
+if not CONFIG.get("ELEVENLABS_API_KEY"):
+    print("Warning: ELEVENLABS_API_KEY not found in environment or config.json")
 
-# Initialize configuration
-CONFIG = load_config()
+# ------------ Clients ------------
+dg_client = Deepgram(CONFIG.get("DEEPGRAM_API_KEY")) if CONFIG.get("DEEPGRAM_API_KEY") else None
+openai_client = OpenAI(api_key=CONFIG.get("OPENAI_API_KEY")) if CONFIG.get("OPENAI_API_KEY") else None
+tts_client = ElevenLabs(api_key=CONFIG.get("ELEVENLABS_API_KEY")) if CONFIG.get("ELEVENLABS_API_KEY") else None
 
-# Create clients for Deepgram, OpenAI, and ElevenLabs APIs using keys from config
-dg_client = Deepgram(CONFIG['deepgram_api_key'])
-openai_client = OpenAI(api_key=CONFIG['openai_api_key'])
-tts_client = ElevenLabs(api_key=CONFIG['elevenlabs_api_key'])
+# Default voice id if not provided
+DEFAULT_VOICE_ID = CONFIG.get("VOICE_ID") or "XrExE9yKIg1WjnnlVkGX"
 
-# Initialize message list with system instructions for OpenAI
+# ------------ Conversation memory and persona ------------
 messages = []
-
-# System instructions for the assistant's personality and tone
 system_msg = """Your name is Matilda. Matilda is a warm and friendly voicebot designed to have pleasant and engaging 
 conversations with customers. Matilda's primary purpose is to greet customers in a cheerful and polite manner whenever 
 they say 'hello' or any other greeting. She should respond with kindness, using a welcoming tone to make the customer 
@@ -42,191 +79,237 @@ feel valued and appreciated.
 Matilda should always use positive language and maintain a light, conversational tone throughout the interaction. Her 
 responses should be concise, friendly, and focused on making the customer feel comfortable and engaged. She should avoid 
 overly complex language and strive to keep the conversation pleasant and easy-going."""
-
-# Add system message to conversation history
 messages.append({"role": "system", "content": system_msg})
 
+# ------------ Utility: write PCM16 bytes to WAV BytesIO ------------
+def pcm16_to_wav_bytes(pcm_bytes: bytes, channels: int = 1, sampwidth: int = 2, framerate: int = 8000) -> io.BytesIO:
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(framerate)
+        wf.writeframes(pcm_bytes)
+    wav_io.seek(0)
+    return wav_io
 
-# Load config (to avoid repetition in case of reloading config later)
-def load_config(file_path='config.json'):
-    global CONFIG
-    with open(file_path, 'r') as f:
-        CONFIG = json.load(f)
-
-
-# Transcribes audio to text using Deepgram API
-async def transcribe_audio(audio_chunk, channels=1, sample_width=2, frame_rate=8000):
+# ------------ Deepgram transcription (prerecorded) ------------
+async def transcribe_audio_with_deepgram(pcm_bytes: bytes, sample_rate: int = 8000) -> str:
+    if dg_client is None:
+        print("Deepgram client not configured")
+        return ""
     try:
-        # Convert audio chunk into a NumPy array
-        audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
+        wav_io = pcm16_to_wav_bytes(pcm_bytes, channels=1, sampwidth=2, framerate=sample_rate)
+        response = await dg_client.transcription.prerecorded(
+            {"buffer": wav_io, "mimetype": "audio/wav"},
+            {"punctuate": True},
+        )
+        # navigate response structure safely
+        results = response.get("results", {})
+        channels = results.get("channels", [])
+        if channels and channels[0].get("alternatives"):
+            transcript = channels[0]["alternatives"][0].get("transcript", "")
+            return transcript
+        return ""
+    except Exception:
+        traceback.print_exc()
+        return ""
 
-        # Create an in-memory BytesIO object for WAV file format
-        wav_io = io.BytesIO()
+# ------------ OpenAI response generation ------------
+async def generate_openai_response(user_text: str) -> str:
+    if openai_client is None:
+        print("OpenAI client not configured")
+        return "Sorry, I am unable to respond right now."
+    try:
+        messages.append({"role": "user", "content": user_text})
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
+        # Extract reply safely
+        reply = ""
+        if hasattr(resp, "choices") and resp.choices:
+            first = resp.choices[0]
+            if getattr(first, "message", None):
+                reply = first.message.content
+        # Fallback extraction for dict-like responses
+        if not reply and isinstance(resp, dict):
+            try:
+                reply = resp["choices"][0]["message"]["content"]
+            except Exception:
+                reply = ""
+        if reply:
+            messages.append({"role": "assistant", "content": reply})
+        return reply or "Sorry, I did not understand that."
+    except Exception:
+        traceback.print_exc()
+        return "Sorry, something went wrong while generating the response."
 
-        # Write audio data as WAV format into BytesIO
-        with wave.open(wav_io, 'wb') as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(sample_width)
-            wav_file.setframerate(frame_rate)
-            wav_file.writeframes(audio_data.tobytes())
+# ------------ ElevenLabs TTS and send back to Plivo ------------
+async def synthesize_and_play(text: str, plivo_ws):
+    if tts_client is None:
+        print("ElevenLabs client not configured")
+        return
+    try:
+        # ElevenLabs streaming response returns an iterator of bytes; this may vary by SDK version
+        voice_id = DEFAULT_VOICE_ID
+        stream = tts_client.text_to_speech.convert(
+            voice_id=voice_id,
+            output_format="ulaw_8000",
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            voice_settings=VoiceSettings(
+                stability=0.0,
+                similarity_boost=1.0,
+                style=0.0,
+                use_speaker_boost=True,
+            ),
+        )
 
-        # Reset the stream position of the in-memory WAV file
-        wav_io.seek(0)
+        output = bytearray()
+        # Stream may be sync iterator or async; handle both
+        if hasattr(stream, "__aiter__"):
+            async for chunk in stream:
+                if chunk:
+                    output.extend(chunk)
+        else:
+            for chunk in stream:
+                if chunk:
+                    output.extend(chunk)
 
-        # Send the audio to Deepgram for transcription
-        response = await dg_client.transcription.prerecorded({
-            'buffer': wav_io,  # Audio data in bytearray format
-            'mimetype': 'audio/wav'
-        }, {
-            'punctuate': True  # Enables punctuation in transcription
-        })
-
-        # Extract the transcription result from the response
-        transcription = response['results']['channels'][0]['alternatives'][0]['transcript']
-
-        if transcription != '':
-            print("Transcription: ", transcription)
-
-        return transcription
-    except Exception as e:
-        print("An error occurred during transcription:")
+        # encode to base64 for Plivo
+        encode = base64.b64encode(bytes(output)).decode("utf-8")
+        payload = {
+            "event": "playAudio",
+            "media": {
+                "contentType": "audio/x-mulaw",
+                "sampleRate": 8000,
+                "payload": encode,
+            },
+        }
+        await plivo_ws.send(json.dumps(payload))
+    except Exception:
         traceback.print_exc()
 
+# ------------ WebSocket handler logic for Plivo connections ------------
+async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, silence_threshold_sec: float = 0.5):
+    print("Plivo handler started for connection")
+    vad = webrtcvad.Vad(vad_mode)
 
-# Generate a response using OpenAI and send the reply via Plivo WebSocket
-async def generate_response(input_text, plivo_ws):
-    # Append user input to the conversation history
-    messages.append({"role": "user", "content": input_text})
+    inbuffer = bytearray()
+    silence_accum = 0.0
+    last_chunk_had_speech = False
 
-    # Call the OpenAI API to generate a conversational response
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages
-    )
+    try:
+        async for raw in plivo_ws:
+            try:
+                data = json.loads(raw)
+            except Exception:
+                # ignore non-json messages
+                continue
 
-    # Extract the assistant's response from the API call
-    reply = response.choices[0].message.content
+            event = data.get("event", "")
+            if event == "media":
+                media = data.get("media", {})
+                payload_b64 = media.get("payload")
+                if not payload_b64:
+                    continue
+                chunk = base64.b64decode(payload_b64)
+                # append to buffer
+                inbuffer.extend(chunk)
 
-    # Append assistant response to the conversation history
-    messages.append({"role": "assistant", "content": reply})
-
-    print("OpenAI Response: ", reply)
-
-    # Convert the response into speech and send via WebSocket
-    await text_to_speech_file(reply, plivo_ws)
-
-
-# Converts text to speech using ElevenLabs API and sends it via Plivo WebSocket
-async def text_to_speech_file(text: str, plivo_ws):
-    # Call ElevenLabs API to convert text into speech
-    response = tts_client.text_to_speech.convert(
-        voice_id="XrExE9yKIg1WjnnlVkGX",  # Using a pre-made voice (Adam)
-        output_format="ulaw_8000",  # 8kHz audio format
-        text=text,
-        model_id="eleven_turbo_v2_5",
-        voice_settings=VoiceSettings(
-            stability=0.0,
-            similarity_boost=1.0,
-            style=0.0,
-            use_speaker_boost=True,
-        ),
-    )
-
-    # Collect the audio data from the response
-    output = bytearray(b'')
-    for chunk in response:
-        if chunk:
-            output.extend(chunk)
-
-    # Encode the audio data in Base64 format
-    encode = base64.b64encode(output).decode('utf-8')
-
-    # Send the audio data via WebSocket to Plivo
-    await plivo_ws.send(json.dumps({
-        "event": "playAudio",
-        "media": {
-            "contentType": "audio/x-mulaw",
-            "sampleRate": 8000,
-            "payload": encode
-        }
-    }))
-
-
-# Handles Plivo WebSocket communication for receiving and processing audio
-async def plivo_handler(plivo_ws):
-    async def plivo_receiver(plivo_ws, sample_rate=8000, silence_threshold=0.5):
-        print('Plivo receiver started')
-
-        # Initialize voice activity detection (VAD) with sensitivity level
-        vad = webrtcvad.Vad(1)  # Level 1 is least sensitive
-
-        inbuffer = bytearray(b'')  # Buffer to hold received audio chunks
-        silence_start = 0  # Track when silence begins
-        chunk = None  # Audio chunk
-
-        try:
-            async for message in plivo_ws:
-                try:
-                    # Decode incoming messages from the WebSocket
-                    data = json.loads(message)
-
-                    # If 'media' event, process the audio chunk
-                    if data['event'] == 'media':
-                        media = data['media']
-                        chunk = base64.b64decode(media['payload'])
-                        inbuffer.extend(chunk)
-
-                    # If 'stop' event, end receiving process
-                    if data['event'] == 'stop':
+                # VAD expects 16-bit PCM frames per call; depending on chunk size, it may be multiple frames.
+                # webrtcvad expects frame sizes of 10/20/30 ms. We'll approximate by chopping into 20ms frames.
+                frame_bytes = int(sample_rate * 2 * 0.02)  # frame size for 20ms, 2 bytes per sample, mono
+                has_speech = False
+                for start in range(0, len(chunk), frame_bytes):
+                    frame = chunk[start:start + frame_bytes]
+                    if len(frame) < frame_bytes:
                         break
+                    try:
+                        if vad.is_speech(frame, sample_rate):
+                            has_speech = True
+                            break
+                    except Exception:
+                        # if VAD fails on unexpected frame format, ignore
+                        pass
 
-                    if chunk is None:
-                        continue
+                if has_speech:
+                    last_chunk_had_speech = True
+                    silence_accum = 0.0
+                else:
+                    # no speech detected in this incoming chunk
+                    silence_accum += 0.02  # we increment by 20ms steps approximate
+                    # if we have accumulated silence longer than threshold, process buffered audio
+                    if last_chunk_had_speech and silence_accum >= silence_threshold_sec:
+                        # only transcribe if buffer is large enough
+                        if len(inbuffer) > 2048:
+                            print("Silence detected, transcribing buffered audio...")
+                            transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
+                            if transcription:
+                                print("Transcribed:", transcription)
+                                reply = await generate_openai_response(transcription)
+                                print("Reply:", reply)
+                                if reply:
+                                    await synthesize_and_play(reply, plivo_ws)
+                        # reset
+                        inbuffer = bytearray()
+                        silence_accum = 0.0
+                        last_chunk_had_speech = False
 
-                    # Check if the chunk contains speech or silence
-                    is_speech = vad.is_speech(chunk, sample_rate)
+            elif event == "stop":
+                print("Received stop event from Plivo")
+                # If any buffered audio remains, attempt to transcribe
+                if len(inbuffer) > 0:
+                    transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
+                    if transcription:
+                        reply = await generate_openai_response(transcription)
+                        if reply:
+                            await synthesize_and_play(reply, plivo_ws)
+                break
 
-                    if not is_speech:  # Detected silence
-                        silence_start += 0.2  # Increment silence duration (200ms steps)
-                        if silence_start >= silence_threshold:  # If silence exceeds threshold
-                            if len(inbuffer) > 2048:  # Process buffered audio if large enough
-                                transcription = await transcribe_audio(inbuffer)
-                                if transcription != '':
-                                    await generate_response(transcription, plivo_ws)
-                            inbuffer = bytearray(b'')  # Clear buffer after processing
-                            silence_start = 0  # Reset silence timer
-                    else:
-                        silence_start = 0  # Reset if speech is detected
-                except Exception as e:
-                    print(f"Error processing message: {e}")
-                    traceback.print_exc()
-        except websockets.exceptions.ConnectionClosedError as e:
-            print(f"Websocket connection closed")
-        except Exception as e:
-            print(f"Error processing message: {e}")
-            traceback.print_exc()
+            elif event == "start":
+                # Plivo start event for a new stream
+                print("Plivo stream started")
 
-    # Start the receiver for WebSocket messages
-    await plivo_receiver(plivo_ws)
+            # ignore other events or add handling as needed
 
+    except websockets.exceptions.ConnectionClosedError:
+        print("Plivo websocket connection closed unexpectedly")
+    except Exception:
+        traceback.print_exc()
+    finally:
+        print("Plivo handler exiting for connection")
 
-# Router to handle incoming WebSocket connections and routes them to plivo_handler
-async def router(websocket, path):
-    if path == '/stream':
-        print('Plivo connection incoming')
-        await plivo_handler(websocket)
+# ------------ Router and server bootstrap ------------
+async def router(ws, path):
+    if path == "/stream":
+        print("Incoming connection on /stream")
+        await plivo_handler(ws)
+    else:
+        # For any other path, optionally respond or close
+        print(f"Unknown path {path}, closing connection")
+        await ws.close()
 
+def start_server(host: str, port: int):
+    print(f"Starting websocket server on {host}:{port}")
+    return websockets.serve(router, host, port)
 
-# Main function to start the WebSocket server
-def main():
-    # Start the WebSocket server on localhost port 5000
-    server = websockets.serve(router, 'localhost', 5000)
+# ------------ Entrypoint ------------
+if __name__ == "__main__":
+    # Use Render's PORT or fallback to 5000 for local dev
+    try:
+        PORT = int(os.getenv("PORT", os.getenv("port", "5000")))
+    except Exception:
+        PORT = 5000
+    HOST = "0.0.0.0"
 
-    # Run the event loop for the WebSocket server
-    asyncio.get_event_loop().run_until_complete(server)
-    asyncio.get_event_loop().run_forever()
-
-
-# Entry point for running the script
-if __name__ == '__main__':
-    sys.exit(main() or 0)
+    loop = asyncio.get_event_loop()
+    server = start_server(HOST, PORT)
+    loop.run_until_complete(server)
+    print("Server running. Awaiting Plivo connections...")
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print("Shutting down server")
+    finally:
+        loop.stop()
