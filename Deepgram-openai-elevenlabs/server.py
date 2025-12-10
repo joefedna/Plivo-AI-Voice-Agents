@@ -171,9 +171,13 @@ async def transcribe_audio_with_deepgram(pcm_bytes: bytes, sample_rate: int = 80
             channels = results.get("channels", [])
             if channels and channels[0].get("alternatives"):
                 transcript = channels[0]["alternatives"][0].get("transcript", "")
+                # If empty transcript, log the full response for debugging
+                if not transcript:
+                    print("[Deepgram] Empty transcript returned. Full response:")
+                    print(json.dumps(response)[:4000])  # avoid ultra-long logs; prints first 4k chars
                 return transcript
         except Exception:
-            print("[Deepgram] Unexpected response:")
+            print("[Deepgram] Unexpected response structure:")
             print(response)
             return ""
         return ""
@@ -211,9 +215,14 @@ async def generate_openai_response(user_text: str) -> str:
 
 # ---------------- ElevenLabs TTS ----------------
 async def synthesize_and_play(text: str, plivo_ws):
+    """
+    Convert text to ulaw_8000 via ElevenLabs (or configured TTS), then send to Plivo in
+    multiple playAudio events with smaller payloads to avoid large single-message failures.
+    """
     if tts_client is None:
         print("[ElevenLabs] client not configured")
         return
+
     try:
         voice_id = DEFAULT_VOICE_ID
         stream = tts_client.text_to_speech.convert(
@@ -229,6 +238,7 @@ async def synthesize_and_play(text: str, plivo_ws):
             ),
         )
 
+        # collect the audio bytes (stream may be async or sync iterator)
         output = bytearray()
         if hasattr(stream, "__aiter__"):
             async for chunk in stream:
@@ -243,17 +253,51 @@ async def synthesize_and_play(text: str, plivo_ws):
             print("[ElevenLabs] TTS produced empty audio")
             return
 
-        encode = base64.b64encode(bytes(output)).decode("utf-8")
-        payload = {
-            "event": "playAudio",
-            "media": {
-                "contentType": "audio/x-mulaw",
-                "sampleRate": 8000,
-                "payload": encode,
-            },
-        }
-        await plivo_ws.send(json.dumps(payload))
-        print(f"[PLAYBACK] Sent audio payload size={len(output)} bytes")
+        # Base64 encode once, then chunk the base64 string for safe sending
+        b64 = base64.b64encode(bytes(output)).decode("utf-8")
+
+        # Determine chunk size: pick small enough to avoid websocket frame issues.
+        # 4096 base64 chars ≈ 3 KB binary. This is conservative.
+        CHUNK_SIZE = 4096
+
+        total = len(b64)
+        sent_bytes = 0
+        idx = 0
+
+        # Send chunks sequentially as separate playAudio events.
+        while idx < total:
+            part = b64[idx: idx + CHUNK_SIZE]
+            payload = {
+                "event": "playAudio",
+                "media": {
+                    "contentType": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "payload": part,
+                    # Optional: explicit outbound track hint
+                    "track": "outbound"
+                }
+            }
+
+            try:
+                await plivo_ws.send(json.dumps(payload))
+                sent_bytes += len(part)
+            except websockets.exceptions.ConnectionClosedError as e:
+                # Connection closed while sending. Log and abort playback.
+                print(f"[API ERROR] ElevenLabs/playAudio send failed: {e}")
+                traceback.print_exc()
+                return
+            except Exception as e:
+                # Other send errors
+                print(f"[API ERROR] Unexpected error while sending playAudio chunk: {e}")
+                traceback.print_exc()
+                return
+
+            # small yield to avoid flooding and allow peer to process
+            await asyncio.sleep(0.04)
+            idx += CHUNK_SIZE
+
+        print(f"[PLAYBACK] Sent audio payload total_base64_chars={total} sent_parts={(total + CHUNK_SIZE - 1)//CHUNK_SIZE} bytes_unencoded={len(output)}")
+
     except Exception as e:
         log_api_error("ElevenLabs", e)
 
