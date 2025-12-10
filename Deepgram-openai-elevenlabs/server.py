@@ -191,8 +191,9 @@ async def synthesize_and_play(text: str, plivo_ws):
         traceback.print_exc()
 
 # ------------ WebSocket handler logic for Plivo connections ------------
+# Replace the existing plivo_handler with this debug version
 async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, silence_threshold_sec: float = 0.5):
-    print("Plivo handler started for connection")
+    print("Plivo handler started for connection (verbose logging enabled)")
     vad = webrtcvad.Vad(vad_mode)
 
     inbuffer = bytearray()
@@ -201,25 +202,45 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
 
     try:
         async for raw in plivo_ws:
+            # Log raw incoming message length and a short preview
+            try:
+                preview = (raw[:200] + '...') if isinstance(raw, (bytes, bytearray)) else (str(raw)[:200] + '...')
+            except Exception:
+                preview = "<could not create preview>"
+            try:
+                print(f"[DEBUG] Received message length={len(raw) if hasattr(raw, '__len__') else 'unknown'} preview={preview}")
+            except Exception:
+                print("[DEBUG] Received a message (could not determine length)")
+
             try:
                 data = json.loads(raw)
-            except Exception:
-                # ignore non-json messages
+            except Exception as e:
+                print(f"[DEBUG] Failed to parse JSON from incoming message: {e}")
+                # continue to next message rather than aborting
                 continue
 
-            event = data.get("event", "")
+            # Log event and media metadata
+            event = data.get("event", "<no-event>")
+            print(f"[DEBUG] Parsed event: {event}")
+
             if event == "media":
                 media = data.get("media", {})
                 payload_b64 = media.get("payload")
-                if not payload_b64:
+                if payload_b64 is None:
+                    print("[DEBUG] media event received but no payload present")
                     continue
-                chunk = base64.b64decode(payload_b64)
-                # append to buffer
+
+                try:
+                    chunk = base64.b64decode(payload_b64)
+                except Exception as e:
+                    print(f"[DEBUG] Failed to base64-decode payload: {e}")
+                    continue
+
+                print(f"[DEBUG] media chunk decoded size={len(chunk)} bytes")
                 inbuffer.extend(chunk)
 
-                # VAD expects 16-bit PCM frames per call; depending on chunk size, it may be multiple frames.
-                # webrtcvad expects frame sizes of 10/20/30 ms. We'll approximate by chopping into 20ms frames.
-                frame_bytes = int(sample_rate * 2 * 0.02)  # frame size for 20ms, 2 bytes per sample, mono
+                # VAD processing (20ms frames)
+                frame_bytes = int(sample_rate * 2 * 0.02)  # 20ms frames
                 has_speech = False
                 for start in range(0, len(chunk), frame_bytes):
                     frame = chunk[start:start + frame_bytes]
@@ -229,53 +250,58 @@ async def plivo_handler(plivo_ws, sample_rate: int = 8000, vad_mode: int = 1, si
                         if vad.is_speech(frame, sample_rate):
                             has_speech = True
                             break
-                    except Exception:
-                        # if VAD fails on unexpected frame format, ignore
-                        pass
+                    except Exception as e:
+                        print(f"[DEBUG] VAD raised exception on frame: {e}")
+                        # ignore and proceed
 
                 if has_speech:
                     last_chunk_had_speech = True
                     silence_accum = 0.0
                 else:
-                    # no speech detected in this incoming chunk
-                    silence_accum += 0.02  # we increment by 20ms steps approximate
-                    # if we have accumulated silence longer than threshold, process buffered audio
+                    silence_accum += 0.02
                     if last_chunk_had_speech and silence_accum >= silence_threshold_sec:
-                        # only transcribe if buffer is large enough
                         if len(inbuffer) > 2048:
-                            print("Silence detected, transcribing buffered audio...")
-                            transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
-                            if transcription:
-                                print("Transcribed:", transcription)
-                                reply = await generate_openai_response(transcription)
-                                print("Reply:", reply)
-                                if reply:
-                                    await synthesize_and_play(reply, plivo_ws)
-                        # reset
+                            print("[DEBUG] Silence threshold reached, transcribing buffered audio...")
+                            try:
+                                transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
+                                print(f"[DEBUG] Transcription result: {transcription!r}")
+                                if transcription:
+                                    reply = await generate_openai_response(transcription)
+                                    print(f"[DEBUG] OpenAI reply: {reply!r}")
+                                    if reply:
+                                        await synthesize_and_play(reply, plivo_ws)
+                            except Exception as e:
+                                print(f"[ERROR] Exception during transcription/response/synthesis: {e}")
+                                traceback.print_exc()
                         inbuffer = bytearray()
                         silence_accum = 0.0
                         last_chunk_had_speech = False
 
             elif event == "stop":
-                print("Received stop event from Plivo")
-                # If any buffered audio remains, attempt to transcribe
+                print("[DEBUG] Received stop event")
                 if len(inbuffer) > 0:
-                    transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
-                    if transcription:
-                        reply = await generate_openai_response(transcription)
-                        if reply:
-                            await synthesize_and_play(reply, plivo_ws)
+                    try:
+                        transcription = await transcribe_audio_with_deepgram(bytes(inbuffer), sample_rate=sample_rate)
+                        print(f"[DEBUG] Final transcription before stop: {transcription!r}")
+                        if transcription:
+                            reply = await generate_openai_response(transcription)
+                            if reply:
+                                await synthesize_and_play(reply, plivo_ws)
+                    except Exception as e:
+                        print(f"[ERROR] Exception while handling stop event: {e}")
+                        traceback.print_exc()
                 break
 
             elif event == "start":
-                # Plivo start event for a new stream
-                print("Plivo stream started")
+                print("[DEBUG] Received start event")
 
-            # ignore other events or add handling as needed
+            else:
+                print(f"[DEBUG] Unhandled event type: {event}")
 
-    except websockets.exceptions.ConnectionClosedError:
-        print("Plivo websocket connection closed unexpectedly")
-    except Exception:
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"[INFO] WebSocket connection closed: {e}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected exception in plivo_handler: {e}")
         traceback.print_exc()
     finally:
         print("Plivo handler exiting for connection")
