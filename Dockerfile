@@ -12,10 +12,11 @@ RUN apt-get update \
         build-essential \
         libffi-dev \
         libssl-dev \
-        && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy only requirements first to leverage Docker cache
-COPY requirements.txt /app/requirements.txt
+# The repo's requirements.txt lives in Deepgram-openai-elevenlabs/
+COPY Deepgram-openai-elevenlabs/requirements.txt /app/requirements.txt
 
 # Upgrade pip and install Python dependencies
 RUN pip install --upgrade pip setuptools wheel \
@@ -28,5 +29,4 @@ COPY . /app
 ENV PORT=5000
 
 # Run the server. The project places server.py in Deepgram-openai-elevenlabs/
-# Run via python so the file's __main__ bootstrap starts the websockets server.
 CMD ["python", "Deepgram-openai-elevenlabs/server.py"]
